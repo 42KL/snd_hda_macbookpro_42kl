@@ -1262,19 +1262,48 @@ void cs_8409_capture_cleanup(struct hda_codec *codec)
 
 }
 
+// 42KL local patch: unsol_list is drained both by the unsolicited response
+// worker and by the playback/capture pcm hooks, with no locking. When both ran
+// at once (typically at logout with a headset plugged in), one memset an entry
+// the other was still walking and the kernel hit a NULL pointer dereference.
+// All list and slot updates now happen under this lock. Pending entries are
+// moved to a private list and handled outside the lock, because finalize does
+// codec verbs and may sleep.
+static DEFINE_SPINLOCK(cs_8409_unsol_lock);
+
+static void cs_8409_take_unsol_list(struct cs8409_apple_spec *spec, struct list_head *pending)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&cs_8409_unsol_lock, flags);
+	list_splice_init(&spec->unsol_list, pending);
+	spin_unlock_irqrestore(&cs_8409_unsol_lock, flags);
+}
+
+static void cs_8409_release_unsol_item(struct cs8409_apple_spec *spec, struct unsol_item *unsol_entry)
+{
+	unsigned long flags;
+	unsigned int idx = unsol_entry->idx;
+	spin_lock_irqsave(&cs_8409_unsol_lock, flags);
+	// clear the entry before freeing the slot, so a new response cannot be stored in it first
+	memset(unsol_entry, 0, sizeof(struct unsol_item));
+	spec->unsol_items_prealloc_used[idx] = 0;
+	spin_unlock_irqrestore(&cs_8409_unsol_lock, flags);
+}
+
 // routine to clear unsol list
 static void cs_8409_clear_external_device_unsolicited_responses(struct hda_codec *codec)
 {
 	struct cs8409_apple_spec *spec = codec->spec;
 	struct unsol_item *unsol_entry = NULL;
 	struct unsol_item *unsol_temp = NULL;
-	if (!list_empty(&spec->unsol_list)) {
+	LIST_HEAD(pending);
+	cs_8409_take_unsol_list(spec, &pending);
+	if (!list_empty(&pending)) {
 		codec_info(codec, "cs_8409_clear_external_device_unsolicited_responses UNSOL start\n");
-		list_for_each_entry_safe(unsol_entry, unsol_temp, &spec->unsol_list, list)
+		list_for_each_entry_safe(unsol_entry, unsol_temp, &pending, list)
 		{
 			list_del_init(&unsol_entry->list);
-			spec->unsol_items_prealloc_used[unsol_entry->idx] = 0;
-			memset(unsol_entry, 0, sizeof(struct unsol_item));
+			cs_8409_release_unsol_item(spec, unsol_entry);
 		}
 		codec_info(codec, "cs_8409_clear_external_device_unsolicited_responses UNSOL end\n");
 	}
@@ -1287,15 +1316,17 @@ static void cs_8409_perform_external_device_unsolicited_responses(struct hda_cod
 	struct cs8409_apple_spec *spec = codec->spec;
 	struct unsol_item *unsol_entry = NULL;
 	struct unsol_item *unsol_temp = NULL;
-	if (!list_empty(&spec->unsol_list)) {
+	LIST_HEAD(pending);
+	cs_8409_take_unsol_list(spec, &pending);
+	if (!list_empty(&pending)) {
 		codec_info(codec, "cs_8409_perform_external_device_unsolicited_responses UNSOL start\n");
-		list_for_each_entry_safe(unsol_entry, unsol_temp, &spec->unsol_list, list)
+		list_for_each_entry_safe(unsol_entry, unsol_temp, &pending, list)
 		{
 			list_del_init(&unsol_entry->list);
 			// pigs this gets complicated - these might issue other unsol responses
+			// (any that get stored meanwhile go on spec->unsol_list for the next drain)
 			cs_8409_cs42l83_unsolicited_response_finalize(codec, unsol_entry->res);
-			spec->unsol_items_prealloc_used[unsol_entry->idx] = 0;
-			memset(unsol_entry, 0, sizeof(struct unsol_item));
+			cs_8409_release_unsol_item(spec, unsol_entry);
 		}
 		codec_info(codec, "cs_8409_perform_external_device_unsolicited_responses UNSOL end\n");
 	}
@@ -1320,11 +1351,14 @@ static void cs_8409_cs42l83_unsolicited_response(struct hda_codec *codec, unsign
 	{
 		int itm;
 		int new_itm = -1;
+		unsigned long flags;
 		codec_info(codec, "cs_8409_cs42l83_unsolicited_response -     UNSOL BLOCKED\n");
+		spin_lock_irqsave(&cs_8409_unsol_lock, flags);
 		for (itm=0; itm<10; itm++)
 			if (spec->unsol_items_prealloc_used[itm] == 0) { new_itm = itm; break; }
 		if (new_itm < 0)
 		{
+			spin_unlock_irqrestore(&cs_8409_unsol_lock, flags);
 			codec_info(codec, "cs_8409_cs42l83_unsolicited_response - IGNORING UNSOL RESPONSE!!\n");
 			return;
 		}
@@ -1333,6 +1367,7 @@ static void cs_8409_cs42l83_unsolicited_response(struct hda_codec *codec, unsign
                 spec->unsol_items_prealloc[new_itm].res = res;
                 spec->unsol_items_prealloc[new_itm].idx = new_itm;
 		list_add_tail(&(spec->unsol_items_prealloc[new_itm].list), &spec->unsol_list);
+		spin_unlock_irqrestore(&cs_8409_unsol_lock, flags);
 		codec_info(codec, "cs_8409_cs42l83_unsolicited_response - UNSOL response stored\n");
 		return;
         }
