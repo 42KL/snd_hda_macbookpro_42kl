@@ -1,3 +1,53 @@
+# snd_hda_macbookpro: 42 Kuala Lumpur fork
+
+This is [davidjo/snd_hda_macbookpro](https://github.com/davidjo/snd_hda_macbookpro) with one fix on top: a lock on the headset event queue, which stops a kernel crash at logout. The fix changes `patch_cirrus/patch_cirrus_new84.h` only, which the driver uses on every kernel version. Everything else is upstream as of [`89b22ff`](https://github.com/davidjo/snd_hda_macbookpro/commit/89b22ff90b86468b186706861dd18663562defa7) (2026-09-06), and the upstream README follows below.
+
+## The crash
+
+On iMac19,2 (Cirrus Logic CS8409 with a CS42L83 headset codec), the driver could crash the kernel:
+
+```
+BUG: kernel NULL pointer dereference
+RIP: cs_8409_perform_external_device_unsolicited_responses
+```
+
+It only happened in sessions where the 3.5 mm headphone jack was used (about 6% of them, and 0 of 2002 sessions without jack activity). Most crashes came 0–7 s after logout, when pulseaudio closes its streams. The user's pulseaudio was then stuck in D state, so their home directory stayed mounted until the machine was rebooted. Upstream still has the bug at `89b22ff`.
+
+Cause: `cs_8409_perform_external_device_unsolicited_responses()` runs both from the jack event handler and from the playback and capture PCM hooks. Each walked `spec->unsol_list` and `memset` its entries with no lock, so one could follow a `next` pointer the other had just zeroed.
+
+Fix: a spinlock around every update of the list and its slots. The drain functions move the pending entries to a local list under the lock and handle them outside it, because handling an entry sends codec verbs and may sleep.
+
+## Tested on
+
+iMac19,2, Ubuntu 22.04, kernel `6.5.0-44-generic`.
+
+- The fix was first built on the older upstream commit `259cc39` (module md5 `ba23564f9f3e4756b5c4d91383849f92`, srcversion `8F7574D0F55B9DA0FCFA570`). Speakers to internal mic loopback works the same as without the fix, and 40 simultaneous playback and capture open/close cycles passed with no kernel warnings.
+- That build has run on about 130 machines since 2026-10-09. From 2026-10-09 to 2026-10-12 they logged over 8,600 headset jack events and no crashes. Before the fix there were 25 crashes in 21 days.
+- This branch (`89b22ff` plus the fix) builds on `6.5.0-44-generic` (srcversion `35698FC3334828B08EA50B2`, 2026-10-13) but has not been loaded on a machine yet. For kernels before 6.17, the only driver changes since `259cc39` are braces around debug prints and a mic change behind the `INTERNAL_MIKE_ONLY` build flag, which is off by default.
+
+## Building
+
+Same as upstream. On Ubuntu the script takes the sound sources from the kernel source package:
+
+```sh
+sudo apt install linux-source-6.5.0
+sudo ./install.cirrus.driver.sh
+```
+
+This installs `/lib/modules/$(uname -r)/updates/snd-hda-codec-cs8409.ko`, which loads at the next boot.
+
+## Taking new upstream changes
+
+The 42KL workstations build from `master` of this repo every time the Ansible role runs, so build and test on one machine before pushing:
+
+```sh
+git remote add upstream https://github.com/davidjo/snd_hda_macbookpro.git
+git fetch upstream
+git merge upstream/master
+```
+
+---
+
 # snd_hda_macbookpro
 
 This is a kernel driver for sound on Macs with Cirrus 8409 HDA chips.
